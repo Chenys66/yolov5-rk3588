@@ -1,0 +1,108 @@
+# GitHub Actions workflow: ONNX → RKNN (RK3588 FP16)
+# 用法：见 GITHUB_SETUP.md
+name: ONNX → RKNN (RK3588 FP16)
+
+on:
+  workflow_dispatch:    # 手动触发 (网页按钮 + 输入参数)
+    inputs:
+      onnx_url:
+        description: 'ONNX 文件的下载直链（GitHub Release 资产 URL 或任意 https 直链）'
+        required: true
+        type: string
+      onnx_filename:
+        description: '保存到 runner 时的文件名（建议带 .onnx 后缀）'
+        required: true
+        default: 'model.onnx'
+        type: string
+      target_size:
+        description: '输入尺寸 height,width（逗号分隔；416,416 表示 416×416）'
+        required: false
+        default: '416,416'
+        type: string
+
+jobs:
+  convert:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libhdf5-dev libgl1 libglib2.0-0 libgomp1
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install RKNN Toolkit2 v2.3.2 wheel
+        run: |
+          pip install --quiet onnx numpy
+          wget -q \
+            "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknn-toolkit2/packages/x86_64/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+          pip install --quiet \
+            "rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+
+      - name: Download ONNX from URL
+        run: |
+          echo ">>> 下载 ONNX: ${{ github.event.inputs.onnx_url }}"
+          curl -fL --retry 3 -o "${{ github.event.inputs.onnx_filename }}" \
+            "${{ github.event.inputs.onnx_url }}"
+          ls -la "${{ github.event.inputs.onnx_filename }}"
+
+      - name: Convert ONNX to RKNN (FP16)
+        env:
+          ONNX_FILE: ${{ github.event.inputs.onnx_filename }}
+          TARGET_SIZE: ${{ github.event.inputs.target_size }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          from rknn.api import RKNN
+
+          onnx_path = os.environ["ONNX_FILE"]
+          h, w = [int(x) for x in os.environ["TARGET_SIZE"].split(",")]
+          print(f"[info] ONNX: {onnx_path}  ({os.path.getsize(onnx_path)/1024/1024:.1f} MB)")
+          print(f"[info] 输入尺寸: {h}x{w}, 目标: rk3588, 量化: FP16")
+
+          rknn = RKNN(verbose=True)
+          rknn.config(
+              target_platform='rk3588',
+              mean_values=[[0, 0, 0]],       # YOLOv5 /255 归一化
+              std_values=[[255, 255, 255]]
+          )
+
+          print(">>> load_onnx")
+          ret = rknn.load_onnx(
+              model=onnx_path,
+              inputs=['images'],
+              input_size_list=[[1, 3, h, w]]
+          )
+          if ret != 0:
+              sys.exit(f"load_onnx failed (ret={ret})")
+
+          print(">>> build (FP16)")
+          ret = rknn.build(do_quantization=False)
+          if ret != 0:
+              sys.exit(f"build failed (ret={ret})")
+
+          print(">>> export_rknn")
+          out_name = os.path.splitext(os.path.basename(onnx_path))[0] + '_rk3588_fp16.rknn'
+          ret = rknn.export_rknn(out_name)
+          if ret != 0:
+              sys.exit(f"export_rknn failed (ret={ret})")
+
+          print(f"[ok] 生成: {out_name}  ({os.path.getsize(out_name)/1024/1024:.1f} MB)")
+          rknn.release()
+          PY
+
+      - name: Upload .rknn as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rknn-model
+          path: ./*.rknn
+          if-no-files-found: error
+          retention-days: 14
