@@ -71,8 +71,8 @@ jobs:
           rknn = RKNN(verbose=True)
           rknn.config(
               target_platform='rk3588',
-              mean_values=[[0, 0, 0]],
-              std_values=[[255, 255, 255]]
+              mean_values=[[0, 0, 0]], # YOLOv5 /255 后是 [0,1] 浮点，std=1
+              std_values=[[1, 1, 1]]
           )
 
           print(">>> load_onnx")
@@ -83,7 +83,7 @@ jobs:
               input_size_list=[[1, 3, h, w]]
           )
           if ret != 0:
-              sys.exit(f"load_onnx failed (ret={ret})")
+ sys.exit(f"load_onnx failed (ret={ret})")
 
           print(">>> build (FP16)")
           ret = rknn.build(do_quantization=False)
