@@ -41,7 +41,7 @@ jobs:
 
       - name: Install RKNN Toolkit2 v2.3.2 wheel
         run: |
-          pip install --quiet onnx numpy
+          pip install --quiet 'numpy<1.24' onnx
           wget -q \
             "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknn-toolkit2/packages/x86_64/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
           pip install --quiet \
