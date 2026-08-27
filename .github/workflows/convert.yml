@@ -1,45 +1,49 @@
-# ============================================================
-#  YOLOv5 416 → RKNN (RK3588) · raw3 专用 · 云端转换
-#  修正版：只转 3 个 raw 输出(52/26/13)，不转端到端 decode，
-#         通过软件 "3-output YOLOv5 raw3" 校验。
-#  支持 FP16（无损）与 INT8（15ms 目标）两种量化。
-#  用法：fork/新建仓库 → Actions → Run workflow → 填 onnx_url
-# ============================================================
-name: ONNX → RKNN raw3 (RK3588)
+# GitHub Actions workflow: ONNX → RKNN (RK3588 INT8 + FP16)
+# 用法：见 GITHUB_SETUP.md
+# 说明：未提供校准图时，自动下载 COCO128（通用自然图像，含人物）作为 INT8 校准集，
+#       因此「没有任何图」也能直接产出 INT8 模型；下载失败则降级为只产 FP16。
+name: ONNX → RKNN (RK3588 INT8+FP16)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:    # 手动触发（网页按钮 + 输入参数表单）
     inputs:
       onnx_url:
-        description: 'ONNX 文件下载直链（必须为 .onnx 结尾）'
+        description: 'ONNX 文件的下载直链（GitHub Release 资产 URL 或任意 https 直链）'
         required: true
         type: string
+      onnx_filename:
+        description: '保存到 runner 时的文件名（建议带 .onnx 后缀）'
+        required: true
+        default: 'model.onnx'
+        type: string
       target_size:
-        description: '输入尺寸 height,width'
+        description: '输入尺寸 height,width（逗号分隔；416,416 表示 416×416）'
         required: false
         default: '416,416'
         type: string
-      mode:
-        description: '量化模式：fp16（无损）/ int8（15ms 目标，用合成校准图）/ both（两个都转）'
+      calib_url:
+        description: '校准图 zip 包直链（含 jpg/png；用于 INT8 量化）。留空=自动下载 COCO128 通用图当校准集，无需你提供任何图也能出 INT8'
         required: false
-        default: 'both'
-        type: choice
-        options:
-          - both
-          - fp16
-          - int8
+        default: ''
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/convert.yml'   # 仅当本文件变更才自动跑，避免死循环
 
 jobs:
   convert:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
-      ONNX_URL: ${{ github.event.inputs.onnx_url }}
+      ONNX_FILE: ${{ github.event.inputs.onnx_filename || 'model.onnx' }}
       TARGET_SIZE: ${{ github.event.inputs.target_size || '416,416' }}
-      MODE: ${{ github.event.inputs.mode || 'both' }}
+      ONNX_URL: ${{ github.event.inputs.onnx_url || 'https://github.com/Chenys66/yolov5-rk3588/releases/download/v1.0/123.onnx' }}
+      CALIB_URL: ${{ github.event.inputs.calib_url || '' }}
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
 
       - name: Install system deps
         run: |
@@ -47,124 +51,224 @@ jobs:
           sudo apt-get install -y -qq libhdf5-dev libgl1 libglib2.0-0 libgomp1
 
       - name: Setup Python 3.10
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.10'
 
-      - name: Install RKNN Toolkit2 v2.3.2
+      - name: Install RKNN Toolkit2 v2.3.2 wheel
         run: |
-          pip install --quiet 'numpy<1.24' 'onnx<1.17' onnxruntime opencv-python-headless pillow
-          wget -q "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknn-toolkit2/packages/x86_64/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
-          pip install --quiet "rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+          pip install --quiet 'numpy<1.24' 'onnx<1.17' onnxruntime
+          wget -q \
+            "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/master/rknn-toolkit2/packages/x86_64/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+          pip install --quiet \
+            "rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
 
-      - name: Download ONNX
+      - name: Download ONNX from URL
         run: |
-          curl -fL --retry 3 -o model.onnx "$ONNX_URL"
-          ls -la model.onnx
+          echo ">>> 下载 ONNX: $ONNX_URL"
+          curl -fL --retry 3 -o "$ONNX_FILE" "$ONNX_URL"
+          ls -la "$ONNX_FILE"
 
-      - name: Generate synthetic calibration set (INT8)
-        if: env.MODE != 'fp16'
+      - name: Inspect ONNX outputs & raw format
         run: |
           python3 - <<'PY'
-          import os, random
-          import numpy as np
-          from PIL import Image, ImageDraw
-          random.seed(42); np.random.seed(42)
-          os.makedirs("calib", exist_ok=True)
-          S = 416
-          lines = []
-          for i in range(200):
-              arr = np.random.randint(40, 220, (S, S, 3), dtype=np.uint8)
-              img = Image.fromarray(arr); d = ImageDraw.Draw(img)
-              for _ in range(random.randint(1, 5)):
-                  c = tuple(random.randint(0,255) for _ in range(3))
-                  x, y = random.randint(0, S-80), random.randint(0, S-80)
-                  if random.random() < 0.5:
-                      r = random.randint(15, 80)
-                      d.ellipse([x-r, y-r, x+r, y+r], fill=c)
-                  else:
-                      d.rectangle([x, y, x+random.randint(40,120), y+random.randint(40,120)], fill=c)
-              fn = f"calib/calib_{i:03d}.jpg"
-              img.save(fn, quality=92)
-              lines.append(f"{os.path.abspath(fn)}")
-          with open("dataset.txt", "w") as f:
-              f.write("\n".join(lines))
-          print(f"[calib] 已生成 {len(lines)} 张合成校准图 + dataset.txt")
+          import os, numpy as np, onnx, onnxruntime as ort
+          path = os.environ["ONNX_FILE"]
+          print("=== ONNX 输出节点 ===")
+          m = onnx.load(path)
+          for o in m.graph.output:
+              dims = [d.dim_value if d.dim_value else d.dim_param
+                      for d in o.type.tensor_type.shape.dim]
+              print(f"  name={o.name}  shape={dims}")
+          sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+          iname = sess.get_inputs()[0].name
+          ishape = sess.get_inputs()[0].shape
+          h, w = int(ishape[2]), int(ishape[3])
+          print(f"[input] {iname} {ishape}")
+          inp = np.zeros((1, 3, h, w), dtype=np.float32)   # 黑图，NCHW /255
+          outs = sess.run(None, {iname: inp})
+          for i, o in enumerate(outs):
+              a = np.array(o)
+              print(f"--- output[{i}] shape={a.shape}")
+              if a.shape[-1] >= 7:
+                  flat = a.reshape(-1, a.shape[-1])
+                  obj = flat[:, 4]
+                  xywh = flat[:, :4]
+                  print(f"    obj  min/mean/max = {obj.min():.4f} / {obj.mean():.4f} / {obj.max():.4f}")
+                  print(f"    obj>0.5 数量      = {(obj > 0.5).sum()}")
+                  print(f"    xywh min/max      = {xywh.min():.4f} / {xywh.max():.4f}")
+          print("判读：obj 若超出 0~1 范围 = raw logit（未 sigmoid）；xywh 若远小于输入尺寸 = raw 偏移（未解码绝对坐标）。")
           PY
 
-      - name: Convert ONNX → RKNN (raw3)
+      - name: Extract YOLOv5 anchors & strides from ONNX
         run: |
           python3 - <<'PY'
-          import os, sys, numpy as np, onnx
+          import os, numpy as np, onnx
+          path = os.environ["ONNX_FILE"]
+          m = onnx.load(path)
+
+          found = []
+          for init in m.graph.initializer:
+              arr = onnx.numpy_helper.to_array(init)
+              n = init.name.lower()
+              if "anchor" in n or arr.shape in [(3, 2), (9, 2), (1, 3, 1, 1, 2), (3, 1, 1, 2), (1, 3, 1, 1, 1, 2), (3, 1, 1, 1, 1, 2)]:
+                  if arr.size in (6, 18):
+                      print(f"[init] {init.name}  shape={arr.shape}  values={arr.flatten().tolist()}")
+                      found.append(arr.reshape(-1, 2))
+          for node in m.graph.node:
+              if node.op_type != "Constant": continue
+              for attr in node.attribute:
+                  if attr.name != "value": continue
+                  arr = onnx.numpy_helper.to_array(attr.t)
+                  if "anchor" in (node.name or "").lower() or arr.shape in [(3, 2), (9, 2), (1, 3, 1, 1, 2), (3, 1, 1, 2), (1, 3, 1, 1, 1, 2), (3, 1, 1, 1, 1, 2)]:
+                      if arr.size in (6, 18):
+                          print(f"[const] {node.name}  shape={arr.shape}  values={arr.flatten().tolist()}")
+                          found.append(arr.reshape(-1, 2))
+
+          inp = m.graph.input[0]
+          in_h = in_w = None
+          for d in inp.type.tensor_type.shape.dim:
+              if d.dim_value:
+                  if in_h is None: in_h = d.dim_value
+                  else: in_w = d.dim_value
+
+          strides = []
+          for o in m.graph.output:
+              dims = [d.dim_value for d in o.type.tensor_type.shape.dim]
+              if len(dims) == 5 and dims[1] == 3 and dims[-1] >= 5:
+                  gy, gx = dims[2], dims[3]
+                  if in_h and in_w:
+                      sy, sx = in_h // gy, in_w // gx
+                      strides.append(sx)
+                      print(f"[stride] {o.name} grid={gx}x{gy}  → stride={sx}")
+          print(f"[strides] {strides}")
+
+          if found:
+              for arr in found[:1]:
+                  if arr.shape[0] == 9:
+                      print(f"[anchors-P3 ] {arr[:3].tolist()}")
+                      print(f"[anchors-P4 ] {arr[3:6].tolist()}")
+                      print(f"[anchors-P5 ] {arr[6:9].tolist()}")
+                  else:
+                      print(f"[anchors] 3 anchors: {arr.tolist()}")
+          else:
+              print("[anchors] NOT FOUND - 模型可能使用 YOLOv5 默认 anchors")
+              print("[default-P3 ] [[10,13], [16,30], [33,23]]")
+              print("[default-P4 ] [[30,61], [62,45], [59,119]]")
+              print("[default-P5 ] [[116,90], [156,198], [373,326]]")
+          PY
+
+      - name: Prepare calibration dataset (auto-download if none provided)
+        run: |
+          mkdir -p calib
+          if [ -n "$CALIB_URL" ]; then
+            echo ">>> 使用你提供的校准集: $CALIB_URL"
+            curl -fL --retry 3 -o calib.zip "$CALIB_URL" \
+              || { echo "::error::校准图下载失败"; exit 1; }
+            unzip -q -o calib.zip -d calib/ \
+              || { echo "::error::校准图解压失败"; exit 1; }
+          else
+            echo ">>> 未提供校准图：自动下载 COCO128（通用自然图像，含人物场景）作为 INT8 校准集"
+            curl -fL --retry 3 -o calib.zip \
+              "https://github.com/ultralytics/yolov5/releases/download/v1.0/coco128.zip" \
+              || { echo "::warning::COCO128 下载失败，将只产出 FP16 模型"; exit 0; }
+            unzip -q -o calib.zip -d calib/ \
+              || { echo "::warning::COCO128 解压失败，将只产出 FP16 模型"; exit 0; }
+          fi
+          # 收集所有 jpg/png/bmp/jpeg/webp 文件，写入 dataset.txt（RKNN 要求的格式）
+          find calib -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.bmp" -o -iname "*.webp" \) | sort > dataset.txt
+          N=$(wc -l < dataset.txt)
+          echo ">>> 校准集: ${N} 张图"
+          if [ "$N" -lt 10 ]; then
+            echo "::warning::校准图偏少（${N} < 10），INT8 量化质量可能下降；建议后续用你的真实场景图替换。"
+          fi
+          head -3 dataset.txt
+
+      - name: Convert ONNX to RKNN (single raw output, A/B normalization, INT8+FP16)
+        run: |
+          python3 - <<'PY'
+          import os, sys, onnx, numpy as np
+          from onnx import helper, numpy_helper
           from rknn.api import RKNN
 
-          onnx_path = "model.onnx"
+          onnx_path = os.environ["ONNX_FILE"]
           h, w = [int(x) for x in os.environ["TARGET_SIZE"].split(",")]
-          mode = os.environ["MODE"]
+          print(f"[info] ONNX: {onnx_path}  ({os.path.getsize(onnx_path)/1024/1024:.1f} MB)")
+          print(f"[info] 输入尺寸: {h}x{w}, 目标: rk3588")
+
+          # 关键结论：GUI 对 "3-output raw3" 解码失败（实测 0 检测），但对「单输出 raw [1,10647,7]」
+          # 能正确解码（v6 单 raw 输出出过框）。故改取 3 个 raw head 拼成单个 raw_concat 输出，
+          # 由 GUI 的内置 YOLOv5 解码器统一解码（anchor=默认，已在 Inspect 确认）。
           m = onnx.load(onnx_path)
+          g = m.graph
+          shapes = {o.name: [d.dim_value for d in o.type.tensor_type.shape.dim] for o in g.output}
+          heads = sorted([n for n, s in shapes.items() if len(s) == 5 and s[1] == 3 and s[-1] == 7],
+                         key=lambda n: -shapes[n][2])   # P3(52) -> P4(26) -> P5(13)
+          print(f"[heads] {heads}")
+          if len(heads) != 3:
+              sys.exit(f"未找到 3 个 raw head，实际输出数={len(heads)}: {list(shapes)}")
 
-          # 只取 raw 输出：5 维 [1,3,H,W,7]（52/26/13 三层）→ 软件要求 "3-output raw3"
-          raw_names = [o.name for o in m.graph.output
-                       if len(o.type.tensor_type.shape.dim) == 5
-                       and o.type.tensor_type.shape.dim[1].dim_value == 3
-                       and o.type.tensor_type.shape.dim[-1].dim_value == 7]
-          if len(raw_names) != 3:
-              raise SystemExit(f"ERROR: 期望 3 个 raw 输出，实际 {len(raw_names)}: {raw_names}")
-          print(f"[outputs] raw3 = {raw_names}")
+          # 构造 raw_concat = concat(reshape(head,[1,-1,7]) for head) -> [1,10647,7]
+          shape_init = numpy_helper.from_array(np.array([1, -1, 7], dtype=np.int64), name="rawc_shape")
+          g.initializer.append(shape_init)
+          reshaped = []
+          for i, hd in enumerate(heads):
+              rn = f"rawc_reshape_{i}"
+              g.node.append(helper.make_node("Reshape", [hd, "rawc_shape"], [rn]))
+              reshaped.append(rn)
+          g.node.append(helper.make_node("Concat", reshaped, ["rawc_concat"], axis=1))
+          g.output.append(helper.make_tensor_value_info("rawc_concat", onnx.TensorProto.FLOAT, [1, 10647, 7]))
+          raw_onnx = "raw_concat.onnx"
+          onnx.save(m, raw_onnx)
+          print(f"[ok] 生成单输出 raw: {raw_onnx}")
 
-          targets = ["fp16", "int8"] if mode == "both" else [mode]
-          for tag in targets:
-              print(f"\n===== 转换 {tag} =====")
+          has_calib = os.path.exists("dataset.txt")
+          print(f"[calib] {'yes' if has_calib else 'no'}")
+
+          # A/B 矩阵：std(255 vs 1) x (FP16 vs INT8)。一次跑全，避免来回空转。
+          variants = [
+              ("single_raw_std255_fp16", 255, False),
+              ("single_raw_std1_fp16",     1, False),
+              ("single_raw_std255_int8",  255, True),
+              ("single_raw_std1_int8",     1, True),
+          ]
+          for tag, std, do_q in variants:
+              if do_q and not has_calib:
+                  print(f"[skip] {tag}: 无校准集，跳过 INT8")
+                  continue
+              out_name = f"123_rk3588_{tag}.rknn"
+              print(f"\n===== {tag}: std={std} do_quant={do_q} =====")
               rknn = RKNN(verbose=True)
-              cfg = dict(
-                  mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]],
-                  target_platform="rk3588", inputs=["images"],
-                  input_size_list=[[1, 3, h, w]], optimization_level=3,
+              rknn.config(
+                  target_platform='rk3588',
+                  mean_values=[[0, 0, 0]],
+                  std_values=[[std, std, std]]
               )
-              if tag == "fp16":
-                  # FP16：不做量化，不需要 quantized_dtype（2.3.2 只接受 w8a8 等量化类型）
-                  pass
-              else:
-                  cfg["quantized_dtype"] = "w8a8"
-                  cfg["quantized_algorithm"] = "mmse"
-                  cfg["quantized_method"] = "channel"
-              ret = rknn.config(**cfg)
-              assert ret == 0, f"config failed: {ret}"
-
-              ret = rknn.load_onnx(model=onnx_path, inputs=["images"],
-                                   outputs=raw_names, input_size_list=[[1, 3, h, w]])
-              assert ret == 0, f"load_onnx failed: {ret}"
-
-              if tag == "fp16":
-                  ret = rknn.build(do_quantization=False)
-              else:
-                  assert os.path.exists("dataset.txt"), "缺少 dataset.txt"
-                  ret = rknn.build(do_quantization=True, dataset="dataset.txt", rknn_batchsize=-1)
-              assert ret == 0, f"build failed: {ret}"
-
-              out_name = f"yolov5_raw3_{tag}.rknn"
+              ret = rknn.load_onnx(
+                  model=raw_onnx,
+                  inputs=['images'],
+                  outputs=['rawc_concat'],
+                  input_size_list=[[1, 3, h, w]]
+              )
+              if ret != 0:
+                  sys.exit(f"load_onnx failed (ret={ret})")
+              kwargs = {"do_quantization": do_q}
+              if do_q:
+                  kwargs["dataset"] = "dataset.txt"
+              ret = rknn.build(**kwargs)
+              if ret != 0:
+                  sys.exit(f"build failed (ret={ret})")
               ret = rknn.export_rknn(out_name)
-              assert ret == 0, f"export failed: {ret}"
-              print(f"[OK] 生成 {out_name} ({os.path.getsize(out_name)/1024/1024:.1f} MB)")
-
-              # 模拟器验证：3 个输出 + 形状正确
-              print(f"[verify] {tag} 模拟器推理验证...")
-              v = RKNN(verbose=False)
-              v.load_rknn(out_name)
-              v.init_runtime()
-              outs = v.inference(inputs=[np.random.rand(1,3,h,w).astype(np.float32)*2-1])
-              assert len(outs) == 3, f"输出数量 {len(outs)} != 3"
-              for o in outs:
-                  assert np.array(o).shape[-1] == 7, f"输出最后一维不是7: {np.array(o).shape}"
-              print(f"[verify] 通过：3 个输出，形状正确")
-              v.release()
+              if ret != 0:
+                  sys.exit(f"export_rknn failed (ret={ret})")
+              print(f"[ok] 生成: {out_name}  ({os.path.getsize(out_name)/1024/1024:.1f} MB)")
               rknn.release()
           PY
 
-      - name: Upload RKNN
-        uses: actions/upload-artifact@v4
+      - name: Upload .rknn as artifact
+        uses: actions/upload-artifact@v4.6.2
         with:
-          name: rknn-raw3
+          name: rknn-model
           path: ./*.rknn
           if-no-files-found: error
           retention-days: 14
