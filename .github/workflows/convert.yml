@@ -86,13 +86,68 @@ jobs:
                   print(f"    obj  min/mean/max = {obj.min():.4f} / {obj.mean():.4f} / {obj.max():.4f}")
                   print(f"    obj>0.5 数量      = {(obj > 0.5).sum()}")
                   print(f"    xywh min/max      = {xywh.min():.4f} / {xywh.max():.4f}")
-          print("判读：obj 若超出 0~1 = raw logit；xywh 远小于输入尺寸 = raw 偏移（未解码）。")
+          print("判读：obj 若超出 0~1 范围 = raw logit（未 sigmoid）；xywh 若远小于输入尺寸 = raw 偏移（未解码绝对坐标）。")
           PY
 
-      - name: Convert ONNX to RKNN (FP16)
+      - name: Extract YOLOv5 anchors & strides from ONNX
+        run: |
+          python3 - <<'PY'
+          import os, numpy as np, onnx
+          path = os.environ["ONNX_FILE"]
+          m = onnx.load(path)
+          found = []
+          for init in m.graph.initializer:
+              arr = onnx.numpy_helper.to_array(init)
+              n = init.name.lower()
+              if "anchor" in n or arr.shape in [(3, 2), (9, 2), (1, 3, 1, 1, 2), (3, 1, 1, 2), (1, 3, 1, 1, 1, 2), (3, 1, 1, 1, 1, 2)]:
+                  if arr.size in (6, 18):
+                      print(f"[init] {init.name}  shape={arr.shape}  values={arr.flatten().tolist()}")
+                      found.append(arr.reshape(-1, 2))
+          for node in m.graph.node:
+              if node.op_type != "Constant": continue
+              for attr in node.attribute:
+                  if attr.name != "value": continue
+                  arr = onnx.numpy_helper.to_array(attr.t)
+                  if "anchor" in (node.name or "").lower() or arr.shape in [(3, 2), (9, 2), (1, 3, 1, 1, 2), (3, 1, 1, 2), (1, 3, 1, 1, 1, 2), (3, 1, 1, 1, 1, 2)]:
+                      if arr.size in (6, 18):
+                          print(f"[const] {node.name}  shape={arr.shape}  values={arr.flatten().tolist()}")
+                          found.append(arr.reshape(-1, 2))
+          inp = m.graph.input[0]
+          in_h = in_w = None
+          for d in inp.type.tensor_type.shape.dim:
+              if d.dim_value:
+                  if in_h is None: in_h = d.dim_value
+                  else: in_w = d.dim_value
+          strides = []
+          for o in m.graph.output:
+              dims = [d.dim_value for d in o.type.tensor_type.shape.dim]
+              if len(dims) == 5 and dims[1] == 3 and dims[-1] >= 5:
+                  gy, gx = dims[2], dims[3]
+                  if in_h and in_w:
+                      sy, sx = in_h // gy, in_w // gx
+                      strides.append(sx)
+                      print(f"[stride] {o.name} grid={gx}x{gy}  → stride={sx}")
+          print(f"[strides] {strides}")
+          if found:
+              for arr in found[:1]:
+                  if arr.shape[0] == 9:
+                      print(f"[anchors-P3 ] {arr[:3].tolist()}")
+                      print(f"[anchors-P4 ] {arr[3:6].tolist()}")
+                      print(f"[anchors-P5 ] {arr[6:9].tolist()}")
+                  else:
+                      print(f"[anchors] 3 anchors: {arr.tolist()}")
+          else:
+              print("[anchors] NOT FOUND - 模型可能使用 YOLOv5 默认 anchors")
+              print("[default-P3 ] [[10,13], [16,30], [33,23]]")
+              print("[default-P4 ] [[30,61], [62,45], [59,119]]")
+              print("[default-P5 ] [[116,90], [156,198], [373,326]]")
+          PY
+
+      - name: Convert ONNX to RKNN (FP16, raw_concat)
         run: |
           python3 - <<'PY'
           import os, sys, onnx
+          from onnx import helper, TensorProto
           from rknn.api import RKNN
 
           onnx_path = os.environ["ONNX_FILE"]
@@ -100,45 +155,48 @@ jobs:
           print(f"[info] ONNX: {onnx_path}  ({os.path.getsize(onnx_path)/1024/1024:.1f} MB)")
           print(f"[info] 输入尺寸: {h}x{w}, 目标: rk3588, 量化: FP16")
 
+          # V6: 把 3 个 raw head(pre-sigmoid) 拼成单输出 raw_concat=[1,10647,7]，
+          #      GUI 拿到 raw 后做标准 YOLOv5 解码(sigmoid+grid-0.5+anchor) 即得到正确框。
+          #      std=255 确保输入归一化([0,255]->[0,1])，与 GUI 如何喂数据无关。
           m = onnx.load(onnx_path)
+          g = m.graph
+          shapes = {o.name: [d.dim_value for d in o.type.tensor_type.shape.dim] for o in g.output}
+          heads = sorted([n for n, s in shapes.items() if len(s) == 5 and s[1] == 3 and s[-1] == 7],
+                         key=lambda n: -shapes[n][2])
+          print(f"[heads] {heads}")
 
-          base = os.path.splitext(os.path.basename(onnx_path))[0]
+          new_nodes, concat_inputs, total = [], [], 0
+          for hd in heads:
+              ny, nx = shapes[hd][2], shapes[hd][3]
+              n = 3 * ny * nx
+              total += n
+              rn, sn = hd + "_rr", hd + "_rshape"
+              g.initializer.append(helper.make_tensor(sn, TensorProto.INT64, [3], [1, n, 7]))
+              new_nodes.append(helper.make_node("Reshape", [hd, sn], [rn]))
+              concat_inputs.append(rn)
+          cn = "raw_concat"
+          new_nodes.append(helper.make_node("Concat", concat_inputs, [cn], axis=1))
+          g.node.extend(new_nodes)
+          g.output.append(helper.make_tensor_value_info(cn, TensorProto.FLOAT, [1, total, 7]))
+          onnx.checker.check_model(m)
+          raw_onnx = "123_raw.onnx"
+          onnx.save(m, raw_onnx)
+          print(f"[ok] 生成 {raw_onnx}，raw_concat=[1,{total},7]")
 
-          # V5: 根因=输入归一化。GUI 喂 uint8 [0,255]，模型训练在 [0,1]，
-          #      std=[[255,255,255]] 让 RKNN 喂网前自动 (x-0)/255，与 GUI 如何喂数据无关。
-          out_defs = [(o.name, [d.dim_value for d in o.type.tensor_type.shape.dim])
-                      for o in m.graph.output]
-
-          def _size(s):
-              p = 1
-              for v in s:
-                  if v > 0: p *= v
-              return p
-
-          single_cands = [(n, s) for n, s in out_defs if len(s) >= 3 and s[-1] == 7]
-          single_name = max(single_cands, key=lambda x: _size(x[1]))[0] if single_cands else 'output'
-          multi_names = [n for n, s in out_defs if len(s) == 5 and s[1] == 3 and s[-1] == 7]
-          print(f"[outputs] single={single_name}  multi={multi_names}")
-
-          variants = [
-              ("single", [single_name], [[0, 0, 0]], [[255, 255, 255]]),
-          ]
-          if multi_names:
-              variants.append(("multi", multi_names, [[0, 0, 0]], [[255, 255, 255]]))
-
-          for tag, out_list, mean, std in variants:
-              print(f"\n===== 配置 {tag}: outputs={out_list} =====")
-              rknn = RKNN(verbose=True)
-              rknn.config(target_platform='rk3588', mean_values=mean, std_values=std)
-              ret = rknn.load_onnx(model=onnx_path, inputs=['images'], outputs=out_list, input_size_list=[[1, 3, h, w]])
-              if ret != 0: sys.exit(f"load_onnx failed (ret={ret})")
-              ret = rknn.build(do_quantization=False)
-              if ret != 0: sys.exit(f"build failed (ret={ret})")
-              out_name = f"{base}_rk3588_fp16_v5_{tag}.rknn"
-              ret = rknn.export_rknn(out_name)
-              if ret != 0: sys.exit(f"export_rknn failed (ret={ret})")
-              print(f"[ok] 生成: {out_name}  ({os.path.getsize(out_name)/1024/1024:.1f} MB)")
-              rknn.release()
+          rknn = RKNN(verbose=True)
+          rknn.config(target_platform='rk3588', mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]])
+          ret = rknn.load_onnx(model=raw_onnx, inputs=['images'], outputs=['raw_concat'], input_size_list=[[1, 3, h, w]])
+          if ret != 0:
+              sys.exit(f"load_onnx failed (ret={ret})")
+          ret = rknn.build(do_quantization=False)
+          if ret != 0:
+              sys.exit(f"build failed (ret={ret})")
+          out_name = "123_rk3588_fp16_v6_raw.rknn"
+          ret = rknn.export_rknn(out_name)
+          if ret != 0:
+              sys.exit(f"export_rknn failed (ret={ret})")
+          print(f"[ok] 生成: {out_name}  ({os.path.getsize(out_name)/1024/1024:.1f} MB)")
+          rknn.release()
           PY
 
       - name: Upload .rknn as artifact
