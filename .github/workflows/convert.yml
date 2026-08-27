@@ -132,7 +132,7 @@ jobs:
                   ret = rknn.build(do_quantization=False)
               else:
                   assert os.path.exists("dataset.txt"), "缺少 dataset.txt"
-                  ret = rknn.build(do_quantization=True, dataset="dataset.txt", rknn_batchsize=-1)
+                  ret = rknn.build(do_quantization=True, dataset="dataset.txt")
               assert ret == 0, f"build failed: {ret}"
 
               out_name = f"yolov5_raw3_{tag}.rknn"
