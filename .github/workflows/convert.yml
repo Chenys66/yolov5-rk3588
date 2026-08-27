@@ -234,8 +234,11 @@ jobs:
           m2 = onnx.load(onnx_path); g2 = m2.graph
           dec6 = make_6ch(m2, g2, main_out, "dec")            # 已解码 output + 合类 -> [1,N,6]
           # 清理 graph.output，只保留本文件用到的输出，避免 RKNN 处理无关节点
-          g.output[:]  = [o for o in g.output if o.name in ("rawc_concat", rc6)]
-          g2.output[:] = [o for o in g2.output if o.name in (main_out, dec6)]
+          # （protobuf RepeatedCompositeFieldContainer 不支持切片赋值，必须 del + extend）
+          keep_raw  = [o for o in g.output if o.name in ("rawc_concat", rc6)]
+          keep_dec  = [o for o in g2.output if o.name in (main_out, dec6)]
+          del g.output[:];  g.output.extend(keep_raw)
+          del g2.output[:]; g2.output.extend(keep_dec)
           raw_onnx = "raw_concat.onnx";  onnx.save(m, raw_onnx)
           dec_onnx = "dec_concat.onnx";  onnx.save(m2, dec_onnx)
           print(f"[ok] raw7/raw6 -> {raw_onnx}; dec7 -> {onnx_path}; dec6 -> {dec_onnx}")
