@@ -204,92 +204,37 @@ jobs:
           main_out = 'output' if 'output' in shapes else heads[0]
           print(f"[main output node] {main_out} shape={shapes.get(main_out)}")
 
-          # ---- 构造 raw_concat [1,N,7] (3 个 raw head 拼) ----
-          shape_init = numpy_helper.from_array(np.array([1, -1, 7], dtype=np.int64), name="rawc_shape")
-          g.initializer.append(shape_init)
-          reshaped = []
-          for i, hd in enumerate(heads):
-              rn = f"rawc_reshape_{i}"
-              g.node.append(helper.make_node("Reshape", [hd, "rawc_shape"], [rn]))
-              reshaped.append(rn)
-          g.node.append(helper.make_node("Concat", reshaped, ["rawc_concat"], axis=1))
-          g.output.append(helper.make_tensor_value_info("rawc_concat", T.FLOAT, [1, 10647, 7]))
-
-          # ---- 通用：从 [1,N,7] 源张量构造 [1,N,6] (xywh + obj + max_cls) ----
-          def make_6ch(mm, gg, source, prefix):
+          # ---- 仅 body 版：从模型自带 output 节点构造 [xywh, obj*body, body_score] ----
+          # head 锚框的 body_score 天然很低 -> 两通道都低 -> 被 GUI 阈值过滤，只出 body。
+          def make_6ch_body(mm, gg, source, prefix):
               ax = numpy_helper.from_array(np.array([2], dtype=np.int64), name=prefix + "_ax")
               gg.initializer.append(ax)
-              for nm, sl, el in [("xywh", 0, 4), ("obj", 4, 5), ("cls", 5, 7)]:
+              for nm, sl, el in [("xywh", 0, 4), ("obj", 4, 5), ("body", 5, 6)]:
                   s = numpy_helper.from_array(np.array([sl], dtype=np.int64), name=prefix + "_s_" + nm)
                   e = numpy_helper.from_array(np.array([el], dtype=np.int64), name=prefix + "_e_" + nm)
                   gg.initializer.append(s); gg.initializer.append(e)
                   gg.node.append(helper.make_node("Slice", [source, prefix + "_s_" + nm, prefix + "_e_" + nm, prefix + "_ax"], [prefix + "_" + nm]))
-              gg.node.append(helper.make_node("ReduceMax", [prefix + "_cls"], [prefix + "_maxcls"], axes=[2], keepdims=1))
+              gg.node.append(helper.make_node("Mul", [prefix + "_obj", prefix + "_body"], [prefix + "_conf"]))  # conf = obj*body
               out6 = prefix + "_6ch"
-              gg.node.append(helper.make_node("Concat", [prefix + "_xywh", prefix + "_obj", prefix + "_maxcls"], [out6], axis=2))
+              gg.node.append(helper.make_node("Concat", [prefix + "_xywh", prefix + "_conf", prefix + "_body"], [out6], axis=2))  # [xywh, conf, body]
               gg.output.append(helper.make_tensor_value_info(out6, T.FLOAT, [1, 10647, 6]))
               return out6
 
-          # ---- 双类 6 通道：GUI single 模式按 [x,y,w,h, score0, score1] 解析双类 ----
-          # 用户实测 dec6 在 GUI 上显示两个类（body/head），说明 GUI 支持双类 single 格式，
-          # 只是通道映射不对。正确格式应是 6 通道 [xywh, body_score, head_score]（无独立 obj 通道，
-          # 否则 7 通道会破坏 6 通道切片→坐标错位）。with_obj=True 时给 [xywh, obj*body, obj*head]。
-          def make_2cls(mm, gg, source, prefix, with_obj):
-              ax = numpy_helper.from_array(np.array([2], dtype=np.int64), name=prefix + "_ax")
-              gg.initializer.append(ax)
-              names = [("xywh", 0, 4), ("b", 5, 6), ("h", 6, 7)]
-              if with_obj:
-                  names.append(("o", 4, 5))
-              for nm, sl, el in names:
-                  s = numpy_helper.from_array(np.array([sl], dtype=np.int64), name=prefix + "_s_" + nm)
-                  e = numpy_helper.from_array(np.array([el], dtype=np.int64), name=prefix + "_e_" + nm)
-                  gg.initializer.append(s); gg.initializer.append(e)
-                  gg.node.append(helper.make_node("Slice", [source, prefix + "_s_" + nm, prefix + "_e_" + nm, prefix + "_ax"], [prefix + "_" + nm]))
-              if with_obj:
-                  gg.node.append(helper.make_node("Mul", [prefix + "_o", prefix + "_b"], [prefix + "_bo"]))
-                  gg.node.append(helper.make_node("Mul", [prefix + "_o", prefix + "_h"], [prefix + "_ho"]))
-                  s0, s1 = prefix + "_bo", prefix + "_ho"
-              else:
-                  s0, s1 = prefix + "_b", prefix + "_h"
-              out6 = prefix + "_6ch"
-              gg.node.append(helper.make_node("Concat", [prefix + "_xywh", s0, s1], [out6], axis=2))
-              gg.output.append(helper.make_tensor_value_info(out6, T.FLOAT, [1, 10647, 6]))
-              return out6
-
-          rc6 = make_6ch(m, g, "rawc_concat", "rc")           # raw 拼 + 合类(max) -> [1,N,6]
-          m2 = onnx.load(onnx_path); g2 = m2.graph
-          dec6 = make_6ch(m2, g2, main_out, "dec")            # 已解码 + 合类(max) -> [1,N,6]
-          m4 = onnx.load(onnx_path); g4 = m4.graph
-          dec2 = make_2cls(m4, g4, main_out, "dec2", with_obj=False)   # [xywh, body, head] 双类
-          m5 = onnx.load(onnx_path); g5 = m5.graph
-          dec2c = make_2cls(m5, g5, main_out, "dec2c", with_obj=True)  # [xywh, obj*body, obj*head] 双类
-          # 清理 graph.output，只保留本文件用到的输出，避免 RKNN 处理无关节点
+          mm = onnx.load(onnx_path); gg = mm.graph
+          decb = make_6ch_body(mm, gg, main_out, "decb")       # [xywh, obj*body, body] 仅 body
+          # 清理 graph.output，只保留本文件用到的输出
           # （protobuf RepeatedCompositeFieldContainer 不支持切片赋值，必须 del + extend）
-          keep_raw  = [o for o in g.output if o.name in ("rawc_concat", rc6)]
-          keep_dec  = [o for o in g2.output if o.name in (main_out, dec6)]
-          keep_2    = [o for o in g4.output if o.name in (main_out, dec2)]
-          keep_2c   = [o for o in g5.output if o.name in (main_out, dec2c)]
-          del g.output[:];  g.output.extend(keep_raw)
-          del g2.output[:]; g2.output.extend(keep_dec)
-          del g4.output[:]; g4.output.extend(keep_2)
-          del g5.output[:]; g5.output.extend(keep_2c)
-          raw_onnx = "raw_concat.onnx";  onnx.save(m, raw_onnx)
-          dec_onnx = "dec_concat.onnx";  onnx.save(m2, dec_onnx)
-          dec2_onnx = "dec_2cls.onnx";   onnx.save(m4, dec2_onnx)
-          dec2c_onnx = "dec_2clsc.onnx"; onnx.save(m5, dec2c_onnx)
-          print(f"[ok] raw7/raw6 -> {raw_onnx}; dec7 -> {onnx_path}; dec6 -> {dec_onnx}; dec2 -> {dec2_onnx}; dec2c -> {dec2c_onnx}")
+          keep_body = [o for o in gg.output if o.name in (main_out, decb)]
+          del gg.output[:];  gg.output.extend(keep_body)
+          decb_onnx = "dec_body.onnx";  onnx.save(mm, decb_onnx)
+          print(f"[ok] decb(body-only) -> {decb_onnx}")
 
           has_calib = os.path.exists("dataset.txt")
           print(f"[calib] {'yes' if has_calib else 'no'}")
 
-          # 四个布局变体，覆盖 raw-vs-decoded x 7ch-vs-6ch 两个轴，std 固定 255（已确认正确）
+          # 只产出唯一变体：仅识别 body（其余布局用户已保存，不再重复生成）
           variants = [
-              ("single_raw7", raw_onnx, "rawc_concat", "raw head 拼 [1,N,7] (pre-sigmoid logits)"),
-              ("single_raw6", raw_onnx, rc6,           "raw head 拼 + 合类 [1,N,6]"),
-              ("single_dec7", onnx_path, main_out,     "模型自带 output 节点 [1,N,7] (已解码)"),
-              ("single_dec6", dec_onnx,  dec6,         "output 节点 + 合类 [1,N,6] (已解码, 单类)"),
-              ("single_dec6_2cls", dec2_onnx, dec2,    "output [xywh, body, head] 双类 6ch"),
-              ("single_dec6_2clsc", dec2c_onnx, dec2c, "output [xywh, obj*body, obj*head] 双类 6ch"),
+              ("single_dec6_body", decb_onnx, decb, "output [xywh, obj*body, body_score] 仅 body"),
           ]
           qtypes = [("int8", True), ("fp16", False)] if has_calib else [("fp16", False)]
           for tag, model, out_node, desc in variants:
@@ -313,11 +258,9 @@ jobs:
                   print(f"[ok] 生成: {full}  ({os.path.getsize(full)/1024/1024:.1f} MB)")
                   rknn.release()
 
-          print("\n>>> 四个变体说明（在 GUI 上各导入一次，看哪个出真目标/假目标最少）：")
-          print("    single_raw7 : 旧方案（预期仍 18 假目标，作对照）")
-          print("    single_raw6 : raw 合类成 6 通道")
-          print("    single_dec7 : 直接用模型已解码 output（最值得试的新方向）")
-          print("    single_dec6 : 已解码 + 合类 6 通道")
+          print("\n>>> 仅生成 single_dec6_body（仅识别 body）：")
+          print("    123_rk3588_single_dec6_body_int8.rknn  (主产物, 有校准集时)")
+          print("    123_rk3588_single_dec6_body_fp16.rknn  (兜底)")
           PY
 
       - name: ONNX baseline detection count (诊断假目标来源)
