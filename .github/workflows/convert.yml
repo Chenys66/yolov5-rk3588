@@ -204,24 +204,27 @@ jobs:
           main_out = 'output' if 'output' in shapes else heads[0]
           print(f"[main output node] {main_out} shape={shapes.get(main_out)}")
 
-          # ---- 仅 body 版：从模型自带 output 节点构造 [xywh, obj*body, body_score] ----
-          # head 锚框的 body_score 天然很低 -> 两通道都低 -> 被 GUI 阈值过滤，只出 body。
+          # ---- 仅 body 版：从模型自带 output 节点构造 [xywh, body, body] ----
+          # 置信度直接用 body 分数本身（直接模型输出，INT8 量化良好），
+          # head 锚框的 body 分数天然很低 -> 被 GUI 阈值过滤 -> 只出 body。
           def make_6ch_body(mm, gg, source, prefix):
               ax = numpy_helper.from_array(np.array([2], dtype=np.int64), name=prefix + "_ax")
               gg.initializer.append(ax)
-              for nm, sl, el in [("xywh", 0, 4), ("obj", 4, 5), ("body", 5, 6)]:
+              for nm, sl, el in [("xywh", 0, 4), ("body", 5, 6)]:
                   s = numpy_helper.from_array(np.array([sl], dtype=np.int64), name=prefix + "_s_" + nm)
                   e = numpy_helper.from_array(np.array([el], dtype=np.int64), name=prefix + "_e_" + nm)
                   gg.initializer.append(s); gg.initializer.append(e)
                   gg.node.append(helper.make_node("Slice", [source, prefix + "_s_" + nm, prefix + "_e_" + nm, prefix + "_ax"], [prefix + "_" + nm]))
-              gg.node.append(helper.make_node("Mul", [prefix + "_obj", prefix + "_body"], [prefix + "_conf"]))  # conf = obj*body
+              # 关键修正：置信度直接用 body 分数本身（直接模型输出，量化良好），
+              # 第6通道也填 body。head 锚框的 body 分数天然很低 → 被 GUI 阈值过滤 → 只出 body。
+              # （之前用 obj*body 乘积，INT8 量化后极小 → 0 检测，已废弃）
               out6 = prefix + "_6ch"
-              gg.node.append(helper.make_node("Concat", [prefix + "_xywh", prefix + "_conf", prefix + "_body"], [out6], axis=2))  # [xywh, conf, body]
+              gg.node.append(helper.make_node("Concat", [prefix + "_xywh", prefix + "_body", prefix + "_body"], [out6], axis=2))  # [xywh, body, body]
               gg.output.append(helper.make_tensor_value_info(out6, T.FLOAT, [1, 10647, 6]))
               return out6
 
           mm = onnx.load(onnx_path); gg = mm.graph
-          decb = make_6ch_body(mm, gg, main_out, "decb")       # [xywh, obj*body, body] 仅 body
+          decb = make_6ch_body(mm, gg, main_out, "decb")       # [xywh, body, body] 仅 body
           # 清理 graph.output，只保留本文件用到的输出
           # （protobuf RepeatedCompositeFieldContainer 不支持切片赋值，必须 del + extend）
           keep_body = [o for o in gg.output if o.name in (main_out, decb)]
@@ -234,7 +237,7 @@ jobs:
 
           # 只产出唯一变体：仅识别 body（其余布局用户已保存，不再重复生成）
           variants = [
-              ("single_dec6_body", decb_onnx, decb, "output [xywh, obj*body, body_score] 仅 body"),
+              ("single_dec6_body", decb_onnx, decb, "output [xywh, body, body] 仅 body (置信度=body 分数)"),
           ]
           qtypes = [("int8", True), ("fp16", False)] if has_calib else [("fp16", False)]
           for tag, model, out_node, desc in variants:
